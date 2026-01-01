@@ -1,0 +1,13 @@
+{
+  "tasks": {
+    "start": "deno run --allow-net --allow-read --allow-env server.ts",
+    "dev": "deno run --watch --allow-net --allow-read --allow-env server.ts"
+  },
+  "imports": {
+    "oak": "https://deno.land/x/oak@v12.6.1/mod.ts",
+    "websocket": "https://deno.land/x/websocket@v0.1.4/mod.ts"
+  },
+  "compilerOptions": {
+    "lib": ["deno.window"]
+  }
+}
