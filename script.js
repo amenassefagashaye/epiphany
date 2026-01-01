@@ -1,4 +1,5 @@
-// Real-Time Communication Bingo Game - Frontend
+// Assefa Digital Bingo - Real-Time Multiplayer Game
+// Frontend JavaScript with WebSocket integration
 
 class BingoGameClient {
     constructor() {
@@ -12,14 +13,38 @@ class BingoGameClient {
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 5;
         this.reconnectDelay = 2000;
+        this.autoCallInterval = null;
+        this.isAutoCalling = false;
+        this.soundEnabled = true;
+        this.lastWinner = null;
+        this.gameStartTime = null;
+        
+        // PRODUCTION CONFIGURATION
+        this.config = {
+            // Replace with your actual Deno Deploy URL
+            wsUrl: 'wss://assefa-bingo-api.deno.dev/ws', // ← CHANGE THIS TO YOUR DENO DEPLOY URL
+            
+            // For local development testing:
+            // wsUrl: window.location.hostname === 'localhost' 
+            //     ? 'ws://localhost:8080/ws'
+            //     : 'wss://YOUR-PROJECT-NAME.deno.dev/ws',
+            
+            autoCallDelay: 5000, // 5 seconds
+            maxPlayers: 10,
+            maxRooms: 100,
+            version: '1.0.0'
+        };
         
         this.initialize();
     }
     
     initialize() {
+        console.log('Initializing Assefa Digital Bingo v' + this.config.version);
+        console.log('Connecting to WebSocket:', this.config.wsUrl);
         this.setupEventListeners();
-        this.connectToServer();
         this.loadPlayerData();
+        this.connectToServer();
+        this.setupAutoRefresh();
     }
     
     setupEventListeners() {
@@ -30,32 +55,79 @@ class BingoGameClient {
         if (savedRoom && savedName) {
             document.getElementById('playerName').value = savedName;
             document.getElementById('roomCode').value = savedRoom;
+            document.getElementById('newPlayerName').value = savedName;
         }
+        
+        // Handle Enter key for chat
+        document.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter' && e.target.tagName !== 'TEXTAREA') {
+                if (e.target.id === 'chatInput') {
+                    this.sendChatMessage();
+                }
+            }
+        });
+        
+        // Handle visibility change for reconnection
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && !this.socket) {
+                this.connectToServer();
+            }
+        });
+    }
+    
+    loadPlayerData() {
+        const savedName = localStorage.getItem('bingo_player_name');
+        const soundPref = localStorage.getItem('bingo_sound_enabled');
+        
+        if (savedName) {
+            this.playerName = savedName;
+            document.getElementById('playerName').value = savedName;
+            document.getElementById('newPlayerName').value = savedName;
+        }
+        
+        if (soundPref !== null) {
+            this.soundEnabled = soundPref === 'true';
+            this.updateSoundButton();
+        }
+    }
+    
+    savePlayerData() {
+        if (this.playerName) {
+            localStorage.setItem('bingo_player_name', this.playerName);
+        }
+        localStorage.setItem('bingo_sound_enabled', this.soundEnabled.toString());
     }
     
     async connectToServer() {
         try {
-            // For local development
-            const wsUrl = window.location.hostname === 'localhost' 
-                ? 'ws://localhost:8080/ws'
-                : 'wss://your-deno-server.deno.dev/ws'; // Replace with your Deno deploy URL
+            console.log('Connecting to WebSocket:', this.config.wsUrl);
+            this.updateConnectionStatus(false);
             
-            this.socket = new WebSocket(wsUrl);
+            this.socket = new WebSocket(this.config.wsUrl);
             
             this.socket.onopen = () => this.handleConnectionOpen();
             this.socket.onmessage = (event) => this.handleMessage(event);
             this.socket.onclose = () => this.handleConnectionClose();
             this.socket.onerror = (error) => this.handleConnectionError(error);
             
+            // Add connection timeout
+            setTimeout(() => {
+                if (this.socket && this.socket.readyState === WebSocket.CONNECTING) {
+                    console.log('WebSocket connection timeout');
+                    this.showNotification('Connection timeout. Check your internet.', 'error');
+                    this.socket.close();
+                }
+            }, 10000);
+            
         } catch (error) {
             console.error('Failed to connect:', error);
-            this.showNotification('Failed to connect to server', true);
+            this.showNotification('Failed to connect to game server', 'error');
             this.scheduleReconnect();
         }
     }
     
     handleConnectionOpen() {
-        console.log('Connected to server');
+        console.log('✅ WebSocket connected successfully');
         this.reconnectAttempts = 0;
         this.updateConnectionStatus(true);
         
@@ -78,7 +150,7 @@ class BingoGameClient {
     handleMessage(event) {
         try {
             const data = JSON.parse(event.data);
-            console.log('Received:', data);
+            console.log('📨 Received:', data.type);
             
             switch (data.type) {
                 case 'player_connected':
@@ -121,12 +193,20 @@ class BingoGameClient {
                     this.handlePlayerLeft(data);
                     break;
                     
+                case 'player_joined':
+                    this.handlePlayerJoined(data);
+                    break;
+                    
                 case 'rooms_list':
                     this.handleRoomsList(data);
                     break;
                     
                 case 'error':
                     this.handleError(data);
+                    break;
+                    
+                case 'pong':
+                    // Keep-alive response
                     break;
                     
                 default:
@@ -138,14 +218,19 @@ class BingoGameClient {
     }
     
     handleConnectionClose() {
-        console.log('Disconnected from server');
+        console.log('🔌 WebSocket disconnected');
         this.updateConnectionStatus(false);
+        
+        if (this.currentRoom) {
+            this.showNotification('Connection lost. Attempting to reconnect...', 'warning');
+        }
+        
         this.scheduleReconnect();
     }
     
     handleConnectionError(error) {
         console.error('WebSocket error:', error);
-        this.showNotification('Connection error', true);
+        this.showNotification('Connection error to game server', 'error');
     }
     
     scheduleReconnect() {
@@ -160,84 +245,40 @@ class BingoGameClient {
                     this.connectToServer();
                 }
             }, delay);
+        } else {
+            this.showNotification('Unable to connect to game server. Please refresh the page.', 'error');
         }
     }
     
     sendMessage(data) {
         if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-            this.socket.send(JSON.stringify(data));
+            try {
+                this.socket.send(JSON.stringify(data));
+            } catch (error) {
+                console.error('Failed to send message:', error);
+                this.showNotification('Failed to send message. Reconnecting...', 'error');
+                this.connectToServer();
+            }
         } else {
             console.error('WebSocket is not open');
+            this.showNotification('Connection lost. Reconnecting...', 'warning');
+            this.connectToServer();
         }
     }
     
-    // UI Helper Functions
-    updateConnectionStatus(connected) {
-        const statusElement = document.getElementById('connectionStatus');
-        const dot = statusElement.querySelector('.status-dot');
-        const text = statusElement.querySelector('span');
-        
-        if (connected) {
-            statusElement.classList.add('connected');
-            text.textContent = 'Connected to server';
-        } else {
-            statusElement.classList.remove('connected');
-            text.textContent = 'Disconnected - Reconnecting...';
-        }
-    }
-    
-    showNotification(message, isError = false) {
-        const modal = document.getElementById('notificationModal');
-        const messageElement = document.getElementById('notificationMessage');
-        
-        messageElement.textContent = message;
-        messageElement.style.color = isError ? 'var(--red)' : 'var(--green)';
-        
-        modal.classList.add('active');
-        
-        if (!isError) {
-            setTimeout(() => {
-                this.closeNotification();
-            }, 3000);
-        }
-    }
-    
-    closeNotification() {
-        document.getElementById('notificationModal').classList.remove('active');
-    }
-    
-    showWinnerModal(winnerInfo) {
-        const modal = document.getElementById('winnerModal');
-        const winnerInfoElement = document.getElementById('winnerInfo');
-        const patternElement = document.getElementById('modalWinPattern');
-        const amountElement = document.getElementById('modalWinAmount');
-        
-        winnerInfoElement.innerHTML = `
-            <h3>${winnerInfo.playerName}</h3>
-            <p>ሰራ! 🎉</p>
-        `;
-        patternElement.textContent = winnerInfo.pattern;
-        amountElement.textContent = winnerInfo.prize ? `${winnerInfo.prize} ብር` : '';
-        
-        modal.classList.add('active');
-        
-        // Play win sound
-        const winSound = document.getElementById('winSound');
-        winSound.currentTime = 0;
-        winSound.play().catch(() => {});
-    }
-    
-    closeWinnerModal() {
-        document.getElementById('winnerModal').classList.remove('active');
-    }
-    
-    // Room Management
+    // Game Functions
     createRoom() {
         const playerName = document.getElementById('newPlayerName').value.trim();
         const gameType = document.getElementById('gameType').value;
         
         if (!playerName) {
-            this.showNotification('እባክዎ ስምዎን ያስገቡ', true);
+            this.showNotification('Please enter your name', 'error');
+            document.getElementById('newPlayerName').focus();
+            return;
+        }
+        
+        if (playerName.length < 2 || playerName.length > 20) {
+            this.showNotification('Name must be 2-20 characters', 'error');
             return;
         }
         
@@ -249,14 +290,28 @@ class BingoGameClient {
             playerName: playerName,
             gameType: gameType
         });
+        
+        this.showNotification('Creating room...', 'info');
     }
     
     joinRoom(roomCode = null, playerName = null) {
         const code = roomCode || document.getElementById('roomCode').value.trim().toUpperCase();
         const name = playerName || document.getElementById('playerName').value.trim();
         
-        if (!code || !name) {
-            this.showNotification('እባክዎ ስም እና የክፍሉን ኮድ ያስገቡ', true);
+        if (!code) {
+            this.showNotification('Please enter room code', 'error');
+            document.getElementById('roomCode').focus();
+            return;
+        }
+        
+        if (!name) {
+            this.showNotification('Please enter your name', 'error');
+            document.getElementById('playerName').focus();
+            return;
+        }
+        
+        if (name.length < 2 || name.length > 20) {
+            this.showNotification('Name must be 2-20 characters', 'error');
             return;
         }
         
@@ -269,38 +324,50 @@ class BingoGameClient {
             roomCode: code,
             playerName: name
         });
+        
+        this.showNotification('Joining room...', 'info');
     }
     
     leaveRoom() {
         if (this.currentRoom) {
-            this.sendMessage({
-                type: 'leave_room',
-                roomCode: this.currentRoom
-            });
-            
-            this.currentRoom = null;
-            this.gameState = null;
-            this.playerBoard = null;
-            this.markedNumbers.clear();
-            
-            this.showPage('pageLobby');
-            
-            // Update rooms list
-            this.sendMessage({ type: 'get_rooms' });
+            if (confirm('Are you sure you want to leave the room?')) {
+                this.sendMessage({
+                    type: 'leave_room',
+                    roomCode: this.currentRoom
+                });
+                
+                this.currentRoom = null;
+                this.gameState = null;
+                this.playerBoard = null;
+                this.markedNumbers.clear();
+                this.stopAutoCall();
+                
+                this.showPage('pageLobby');
+                this.sendMessage({ type: 'get_rooms' });
+                
+                this.showNotification('Left the room', 'info');
+            }
         }
     }
     
     startGame() {
-        if (this.currentRoom) {
+        if (this.currentRoom && this.gameState?.hostId === this.playerId) {
+            if (this.gameState.players.length < 2) {
+                this.showNotification('Need at least 2 players to start', 'warning');
+                return;
+            }
+            
             this.sendMessage({
                 type: 'start_game',
                 roomCode: this.currentRoom
             });
+            
+            this.showNotification('Starting game...', 'info');
         }
     }
     
     callNextNumber() {
-        if (this.currentRoom && this.gameState?.isHost) {
+        if (this.currentRoom && this.gameState?.hostId === this.playerId) {
             this.sendMessage({
                 type: 'call_number',
                 roomCode: this.currentRoom
@@ -308,16 +375,69 @@ class BingoGameClient {
         }
     }
     
+    toggleAutoCall() {
+        if (!this.currentRoom || this.gameState?.hostId !== this.playerId) {
+            return;
+        }
+        
+        if (this.isAutoCalling) {
+            this.stopAutoCall();
+            this.showNotification('Auto-call stopped', 'info');
+        } else {
+            this.startAutoCall();
+            this.showNotification('Auto-call started', 'success');
+        }
+    }
+    
+    startAutoCall() {
+        this.isAutoCalling = true;
+        document.getElementById('autoCallBtn').textContent = 'Auto-call (Stop)';
+        document.getElementById('autoCallBtn').classList.add('active');
+        
+        // Call first number immediately
+        this.callNextNumber();
+        
+        // Set up interval
+        this.autoCallInterval = setInterval(() => {
+            if (this.gameState?.status === 'playing') {
+                this.callNextNumber();
+            } else {
+                this.stopAutoCall();
+            }
+        }, this.config.autoCallDelay);
+    }
+    
+    stopAutoCall() {
+        this.isAutoCalling = false;
+        if (this.autoCallInterval) {
+            clearInterval(this.autoCallInterval);
+            this.autoCallInterval = null;
+        }
+        
+        document.getElementById('autoCallBtn').textContent = 'Auto-call';
+        document.getElementById('autoCallBtn').classList.remove('active');
+    }
+    
     claimWin() {
         if (this.currentRoom && this.checkWinCondition()) {
+            const pattern = this.detectWinPattern();
+            
             this.sendMessage({
                 type: 'claim_win',
                 roomCode: this.currentRoom,
                 playerId: this.playerId,
-                pattern: this.detectWinPattern()
+                pattern: pattern
             });
+            
+            // Disable claim button temporarily
+            document.getElementById('claimWinBtn').disabled = true;
+            setTimeout(() => {
+                if (document.getElementById('claimWinBtn')) {
+                    document.getElementById('claimWinBtn').disabled = !this.checkWinCondition();
+                }
+            }, 5000);
         } else {
-            this.showNotification('ለማሸነፍ አሁንም አይገባም', true);
+            this.showNotification('Not ready to win yet. Complete the pattern first.', 'warning');
         }
     }
     
@@ -325,7 +445,14 @@ class BingoGameClient {
         const input = document.getElementById('chatInput');
         const message = input.value.trim();
         
-        if (message && this.currentRoom) {
+        if (!message) return;
+        
+        if (message.length > 200) {
+            this.showNotification('Message too long (max 200 chars)', 'warning');
+            return;
+        }
+        
+        if (this.currentRoom) {
             this.sendMessage({
                 type: 'chat_message',
                 roomCode: this.currentRoom,
@@ -334,13 +461,131 @@ class BingoGameClient {
             });
             
             input.value = '';
+            input.focus();
+        }
+    }
+    
+    sendQuickChat(message) {
+        if (this.currentRoom) {
+            this.sendMessage({
+                type: 'chat_message',
+                roomCode: this.currentRoom,
+                playerId: this.playerId,
+                message: message
+            });
+        }
+    }
+    
+    copyRoomCode() {
+        if (this.currentRoom) {
+            navigator.clipboard.writeText(this.currentRoom)
+                .then(() => {
+                    this.showNotification('Room code copied!', 'success');
+                })
+                .catch(err => {
+                    console.error('Failed to copy:', err);
+                    this.showNotification('Could not copy room code', 'error');
+                });
+        }
+    }
+    
+    toggleSound() {
+        this.soundEnabled = !this.soundEnabled;
+        this.updateSoundButton();
+        this.savePlayerData();
+        
+        const message = this.soundEnabled 
+            ? 'Sound enabled 🔊' 
+            : 'Sound muted 🔇';
+        this.showNotification(message, 'info');
+    }
+    
+    updateSoundButton() {
+        const button = document.querySelector('.btn-sound');
+        if (button) {
+            button.textContent = this.soundEnabled ? '🔊' : '🔇';
+        }
+    }
+    
+    playSound(type) {
+        if (!this.soundEnabled) return;
+        
+        try {
+            const audio = document.getElementById(type + 'Sound');
+            if (audio) {
+                audio.currentTime = 0;
+                audio.play().catch(() => {});
+            }
+        } catch (error) {
+            console.log('Audio play error:', error);
+        }
+    }
+    
+    // UI Helper Functions
+    showNotification(message, type = 'info') {
+        const modal = document.getElementById('notificationModal');
+        const messageElement = document.getElementById('notificationMessage');
+        const iconElement = document.getElementById('notificationIcon');
+        
+        const icons = {
+            'info': 'ℹ️',
+            'success': '✅',
+            'warning': '⚠️',
+            'error': '❌'
+        };
+        
+        iconElement.textContent = icons[type] || 'ℹ️';
+        messageElement.textContent = message;
+        modal.classList.add('active');
+        
+        if (type === 'error' && this.soundEnabled) {
+            this.playSound('error');
+        }
+        
+        if (type !== 'error') {
+            setTimeout(() => {
+                this.closeNotification();
+            }, 3000);
+        }
+    }
+    
+    closeNotification() {
+        document.getElementById('notificationModal').classList.remove('active');
+    }
+    
+    showPage(pageId) {
+        document.querySelectorAll('.page-container').forEach(page => {
+            page.classList.remove('active');
+        });
+        document.getElementById(pageId).classList.add('active');
+        
+        // Update page title
+        const titles = {
+            'pageLobby': 'Assefa Digital Bingo - Lobby',
+            'pageRoom': `Room ${this.currentRoom || ''} - Assefa Digital Bingo`,
+            'pageGame': `Game ${this.currentRoom || ''} - Assefa Digital Bingo`
+        };
+        document.title = titles[pageId] || 'Assefa Digital Bingo';
+    }
+    
+    updateConnectionStatus(connected) {
+        const statusElement = document.getElementById('connectionStatus');
+        const dot = statusElement.querySelector('.status-dot');
+        const text = statusElement.querySelector('span');
+        
+        if (connected) {
+            statusElement.classList.add('connected');
+            text.textContent = 'Connected to game server ✓';
+        } else {
+            statusElement.classList.remove('connected');
+            text.textContent = 'Disconnected - Reconnecting...';
         }
     }
     
     // Message Handlers
     handlePlayerConnected(data) {
         this.playerId = data.playerId;
-        console.log(`Connected as player ${this.playerId}`);
+        console.log(`Player connected with ID: ${this.playerId}`);
     }
     
     handleRoomCreated(data) {
@@ -350,7 +595,8 @@ class BingoGameClient {
         this.showPage('pageRoom');
         this.updateRoomUI(data);
         
-        this.showNotification(`ክፍል ${data.roomCode} በተሳካ ሁኔታ ተፈጥሯል!`);
+        this.showNotification(`Room ${data.roomCode} created!`, 'success');
+        this.playSound('join');
     }
     
     handleRoomJoined(data) {
@@ -361,10 +607,11 @@ class BingoGameClient {
         this.showPage('pageRoom');
         this.updateRoomUI(data);
         
-        // Play join sound
-        const joinSound = document.getElementById('joinSound');
-        joinSound.currentTime = 0;
-        joinSound.play().catch(() => {});
+        this.playSound('join');
+        this.showNotification(`Joined room ${data.roomCode}!`, 'success');
+        
+        // Add welcome message
+        this.addChatMessage('System', `Welcome to the room, ${this.playerName}!`, true);
     }
     
     handleRoomUpdate(data) {
@@ -376,45 +623,49 @@ class BingoGameClient {
         this.gameState = data.gameState;
         this.playerBoard = data.board;
         this.markedNumbers.clear();
+        this.gameStartTime = new Date();
         
         this.showPage('pageGame');
         this.updateGameUI(data);
         
-        this.showNotification('ጨዋታው ጀመረ! 🎮');
+        this.showNotification('Game started! 🎮', 'success');
+        this.playSound('join');
+        
+        this.addChatMessage('System', 'Game started! Good luck!', true);
     }
     
     handleNumberCalled(data) {
         const number = data.number;
         const caller = data.callerName;
         
-        // Update UI
         document.getElementById('currentNumber').textContent = number;
         document.getElementById('callerName').textContent = caller;
-        document.getElementById('calledCount').textContent = this.gameState?.calledNumbers?.length || 0;
+        document.getElementById('calledCount').textContent = data.calledNumbers?.length || 0;
         
-        // Add to called numbers display
         this.addCalledNumber(number);
-        
-        // Play sound
-        const callSound = document.getElementById('callSound');
-        callSound.currentTime = 0;
-        callSound.play().catch(() => {});
-        
-        // Mark on board if player has this number
+        this.playSound('call');
         this.markNumberOnBoard(number);
+        
+        if (this.isSpecialNumber(number)) {
+            this.addChatMessage('System', `Special number called: ${number}!`, true);
+        }
     }
     
     handlePlayerWin(data) {
         this.showWinnerModal(data);
         
-        // Add winner to winners list
         this.addWinnerToList(data);
         
-        // Update game state
         if (this.gameState) {
             this.gameState.winners = this.gameState.winners || [];
             this.gameState.winners.push(data);
         }
+        
+        const winMessage = data.playerId === this.playerId
+            ? `🎉 ${data.playerName} (YOU) won with pattern: ${this.getWinPatternName(data.pattern)} 🎉`
+            : `🏆 ${data.playerName} won with pattern: ${this.getWinPatternName(data.pattern)} 🏆`;
+        
+        this.addChatMessage('System', winMessage, true);
     }
     
     handleGameUpdate(data) {
@@ -427,7 +678,13 @@ class BingoGameClient {
     }
     
     handlePlayerLeft(data) {
-        this.showNotification(`${data.playerName} ክፍሉን ለቀቀ`, false);
+        this.showNotification(`${data.playerName} left the room`, 'info');
+        this.addChatMessage('System', `${data.playerName} left the room`, true);
+    }
+    
+    handlePlayerJoined(data) {
+        this.showNotification(`${data.player.name} joined the room`, 'info');
+        this.addChatMessage('System', `${data.player.name} joined the room`, true);
     }
     
     handleRoomsList(data) {
@@ -435,115 +692,284 @@ class BingoGameClient {
     }
     
     handleError(data) {
-        this.showNotification(data.message, true);
+        this.showNotification(data.message, 'error');
+        this.playSound('error');
     }
     
-    // UI Update Functions
-    showPage(pageId) {
-        document.querySelectorAll('.page-container').forEach(page => {
-            page.classList.remove('active');
+    // Utility Functions
+    markNumberOnBoard(number) {
+        const cells = document.querySelectorAll(`[data-number="${number}"]`);
+        cells.forEach(cell => {
+            if (!cell.classList.contains('marked')) {
+                cell.classList.add('marked');
+                this.markedNumbers.add(number);
+                cell.style.animation = 'none';
+                setTimeout(() => {
+                    cell.style.animation = 'pulse 0.5s';
+                }, 10);
+            }
         });
-        document.getElementById(pageId).classList.add('active');
+        
+        this.updateBoardStats();
+        this.checkWinCondition();
+    }
+    
+    checkWinCondition() {
+        if (!this.playerBoard || !this.gameState || this.gameState.status !== 'playing') {
+            return false;
+        }
+        
+        const pattern = this.gameState.winPattern;
+        const isWin = this.checkPatternWin(pattern);
+        
+        const centerCell = document.querySelector('.board-cell.center-cell');
+        if (centerCell) {
+            if (isWin) {
+                centerCell.classList.add('winner-ready');
+                centerCell.textContent = '🎉';
+                centerCell.title = 'Click to claim win!';
+            } else {
+                centerCell.classList.remove('winner-ready');
+                centerCell.textContent = '★';
+                centerCell.title = 'Free space';
+            }
+        }
+        
+        document.getElementById('claimWinBtn').disabled = !isWin;
+        return isWin;
+    }
+    
+    checkPatternWin(pattern) {
+        const totalCells = document.querySelectorAll('.board-cell:not(.blank-cell)').length;
+        const markedCount = this.markedNumbers.size;
+        
+        switch(pattern) {
+            case 'full-house':
+                const freeCells = document.querySelectorAll('.board-cell[data-free="true"]').length;
+                return markedCount >= (totalCells - freeCells);
+            case 'one-line':
+                return this.checkLineWin(1);
+            case 'two-lines':
+                return this.checkLineWin(2);
+            default:
+                return markedCount >= totalCells * 0.8;
+        }
+    }
+    
+    checkLineWin(requiredLines) {
+        const board = document.getElementById('gameBoard');
+        if (!board) return false;
+        
+        const gameType = this.gameState.gameType;
+        let rows = 5, cols = 5;
+        
+        if (gameType === '90ball') {
+            rows = 3; cols = 9;
+        } else if (gameType === '30ball') {
+            rows = 3; cols = 3;
+        }
+        
+        let completedLines = 0;
+        
+        for (let row = 0; row < rows; row++) {
+            let rowComplete = true;
+            for (let col = 0; col < cols; col++) {
+                const index = row * cols + col;
+                const cell = board.children[index];
+                if (cell && !cell.classList.contains('marked') && !cell.classList.contains('blank-cell') && !cell.dataset.free) {
+                    rowComplete = false;
+                    break;
+                }
+            }
+            if (rowComplete) completedLines++;
+        }
+        
+        return completedLines >= requiredLines;
+    }
+    
+    detectWinPattern() {
+        if (this.checkLineWin(1)) return 'one-line';
+        if (this.checkLineWin(2)) return 'two-lines';
+        return 'full-house';
+    }
+    
+    getWinPatternName(pattern) {
+        const patterns = {
+            'full-house': 'Full House',
+            'one-line': 'One Line',
+            'two-lines': 'Two Lines',
+            'x-pattern': 'X Pattern',
+            'four-corners': 'Four Corners',
+            'diagonal': 'Diagonal'
+        };
+        return patterns[pattern] || pattern;
+    }
+    
+    getGameTypeName(gameType) {
+        const types = {
+            '75ball': '75-Bingo',
+            '90ball': '90-Bingo',
+            '30ball': '30-Bingo',
+            'pattern': 'Pattern Bingo',
+            '50ball': '50-Bingo',
+            'coverall': 'Coverall'
+        };
+        return types[gameType] || gameType;
+    }
+    
+    getColorFromName(name) {
+        const colors = ['#0d47a1', '#1a237e', '#311b92', '#4a148c', '#880e4f', '#b71c1c'];
+        let hash = 0;
+        for (let i = 0; i < name.length; i++) {
+            hash = name.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        return colors[Math.abs(hash) % colors.length];
+    }
+    
+    isSpecialNumber(number) {
+        return number === 7 || number === 11 || number === 22 || number === 33 || number === 44 || number === 55 || number === 66 || number === 77;
+    }
+    
+    addChatMessage(sender, message, isSystem = false) {
+        const container = document.getElementById('chatMessages');
+        const element = document.createElement('div');
+        element.className = `chat-message ${isSystem ? 'system' : ''}`;
+        
+        const time = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        
+        if (isSystem) {
+            element.innerHTML = `<span class="time">[${time}]</span> ${message}`;
+        } else {
+            element.innerHTML = `<span class="sender">${sender}:</span> ${message} <span class="time">[${time}]</span>`;
+        }
+        
+        container.appendChild(element);
+        container.scrollTop = container.scrollHeight;
+    }
+    
+    addCalledNumber(number) {
+        const container = document.getElementById('calledNumbers');
+        const element = document.createElement('div');
+        element.className = 'called-number';
+        element.textContent = number;
+        container.appendChild(element);
+        
+        const numbers = container.children;
+        if (numbers.length > 10) {
+            container.removeChild(numbers[0]);
+        }
     }
     
     updateRoomUI(data) {
-        // Update room info
-        document.getElementById('roomName').textContent = 
-            `${data.gameState.gameType} - ${data.playerName}'s Room`;
-        document.getElementById('roomCodeDisplay').textContent = data.roomCode;
-        document.getElementById('playerCount').textContent = data.gameState.players.length;
+        if (!this.gameState) return;
         
-        // Update players list
+        document.getElementById('roomName').textContent = `${this.getGameTypeName(this.gameState.gameType)} - ${this.playerName}'s Room`;
+        document.getElementById('roomCodeDisplay').textContent = this.currentRoom;
+        document.getElementById('playerCount').textContent = this.gameState.players.length;
+        document.getElementById('roomStatus').textContent = this.gameState.status === 'playing' ? 'Playing' : 'Waiting';
+        document.getElementById('gameTypeDisplay').textContent = this.getGameTypeName(this.gameState.gameType);
+        
         const playersList = document.getElementById('playersList');
         playersList.innerHTML = '';
         
-        data.gameState.players.forEach(player => {
-            const playerItem = document.createElement('div');
-            playerItem.className = 'player-item';
-            
-            const isHost = player.id === data.gameState.hostId;
-            const isCurrentPlayer = player.id === this.playerId;
-            
-            playerItem.innerHTML = `
-                <div class="player-avatar" style="background: ${this.getColorFromName(player.name)}">
-                    ${player.name.charAt(0).toUpperCase()}
-                </div>
-                <div class="player-info">
-                    <div class="player-name ${isCurrentPlayer ? 'amharic-text' : ''}">
-                        ${player.name} ${isCurrentPlayer ? '(እርስዎ)' : ''}
+        if (this.gameState.players.length === 0) {
+            playersList.innerHTML = '<div class="no-players">No players yet</div>';
+        } else {
+            this.gameState.players.forEach(player => {
+                const playerItem = document.createElement('div');
+                playerItem.className = 'player-item';
+                
+                const isHost = player.id === this.gameState.hostId;
+                const isCurrentPlayer = player.id === this.playerId;
+                
+                playerItem.innerHTML = `
+                    <div class="player-avatar" style="background: ${this.getColorFromName(player.name)}">
+                        ${player.name.charAt(0).toUpperCase()}
                     </div>
-                    <div class="player-status">
-                        ${isHost ? '<span class="player-host">አስተናጋጅ</span>' : 'ተጫዋች'}
+                    <div class="player-info">
+                        <div class="player-name ${isCurrentPlayer ? 'amharic-text' : ''}">
+                            ${player.name} ${isCurrentPlayer ? '(You)' : ''}
+                        </div>
+                        <div class="player-status">
+                            ${isHost ? '<span class="player-host">Host</span>' : 'Player'}
+                        </div>
                     </div>
-                </div>
-            `;
-            
-            playersList.appendChild(playerItem);
-        });
+                `;
+                playersList.appendChild(playerItem);
+            });
+        }
         
-        // Update game controls based on player role
-        const isHost = this.gameState?.hostId === this.playerId;
-        const isGameActive = this.gameState?.status === 'playing';
+        const isHost = this.gameState.hostId === this.playerId;
+        const isGameActive = this.gameState.status === 'playing';
         
         document.getElementById('startGameBtn').disabled = isGameActive || !isHost;
         document.getElementById('callNumberBtn').disabled = !isGameActive || !isHost;
+        document.getElementById('autoCallBtn').disabled = !isGameActive || !isHost;
+        document.getElementById('claimWinBtn').disabled = true;
         
-        if (this.gameState?.calledNumbers) {
-            document.getElementById('calledCount').textContent = this.gameState.calledNumbers.length;
-            this.updateCalledNumbersDisplay();
-        }
-    }
-    
-    updateGameUI(data) {
-        // Update game info
-        document.getElementById('gameRoomName').textContent = 
-            `${this.gameState.gameType} - ${this.currentRoom}`;
-        document.getElementById('gameStatus').textContent = 
-            this.gameState.status === 'playing' ? 'በመጫወት ላይ' : 'በመጠበቅ ላይ';
-        
-        // Update player board
-        document.getElementById('playerBoardTitle').textContent = 
-            `${this.playerName}'s Board`;
-        
-        // Generate game board if needed
-        if (this.playerBoard && !document.querySelector('.board-cell')) {
-            this.generateGameBoard();
-        }
-        
-        // Update stats
-        this.updateBoardStats();
-        
-        // Update win pattern
-        document.getElementById('winPattern').textContent = 
-            this.getWinPatternName(this.gameState.winPattern);
-        
-        // Update called numbers
         if (this.gameState.calledNumbers) {
             document.getElementById('calledCount').textContent = this.gameState.calledNumbers.length;
             this.updateCalledNumbersDisplay();
         }
         
-        // Update winners list
+        document.getElementById('autoCallBtn').textContent = this.isAutoCalling 
+            ? 'Auto-call (Stop)'
+            : 'Auto-call';
+            
+        if (this.isAutoCalling) {
+            document.getElementById('autoCallBtn').classList.add('active');
+        } else {
+            document.getElementById('autoCallBtn').classList.remove('active');
+        }
+    }
+    
+    updateGameUI(data) {
+        if (!this.gameState) return;
+        
+        document.getElementById('gameRoomName').textContent = `${this.getGameTypeName(this.gameState.gameType)} - ${this.currentRoom}`;
+        document.getElementById('gameStatus').textContent = this.gameState.status === 'playing' ? 'Playing' : 'Waiting';
+        document.getElementById('playerBoardTitle').textContent = `${this.playerName}'s Board`;
+        document.getElementById('winPattern').textContent = this.getWinPatternName(this.gameState.winPattern);
+        
+        if (this.playerBoard && !document.querySelector('.board-cell:not(.loading-board)')) {
+            this.generateGameBoard();
+        }
+        
+        this.updateBoardStats();
+        
+        if (this.gameState.calledNumbers) {
+            document.getElementById('calledCount').textContent = this.gameState.calledNumbers.length;
+            this.updateCalledNumbersDisplay();
+        }
+        
         if (this.gameState.winners) {
             this.updateWinnersList();
         }
+        
+        this.updateGameStats();
+        document.getElementById('claimWinBtn').disabled = !this.checkWinCondition();
     }
     
     generateGameBoard() {
         const boardElement = document.getElementById('gameBoard');
         boardElement.innerHTML = '';
-        boardElement.className = `game-board board-${this.gameState.gameType}`;
         
-        if (!this.playerBoard) return;
+        if (!this.playerBoard) {
+            boardElement.innerHTML = '<div class="loading-board">Loading board...</div>';
+            return;
+        }
         
-        const boardData = this.playerBoard.numbers || this.playerBoard;
+        const gameType = this.gameState.gameType;
+        boardElement.className = `game-board board-${gameType}`;
         
-        if (this.gameState.gameType === '75ball' || this.gameState.gameType === 'pattern') {
-            this.generate75BallBoard(boardData);
-        } else if (this.gameState.gameType === '90ball') {
-            this.generate90BallBoard(boardData);
-        } else if (this.gameState.gameType === '30ball') {
-            this.generate30BallBoard(boardData);
+        if (gameType === '75ball' || gameType === 'pattern' || gameType === '50ball') {
+            this.generate75BallBoard(this.playerBoard);
+        } else if (gameType === '90ball') {
+            this.generate90BallBoard(this.playerBoard);
+        } else if (gameType === '30ball') {
+            this.generate30BallBoard(this.playerBoard);
+        } else if (gameType === 'coverall') {
+            this.generateCoverallBoard(this.playerBoard);
         }
     }
     
@@ -551,29 +977,24 @@ class BingoGameClient {
         const boardElement = document.getElementById('gameBoard');
         const letters = ['B', 'I', 'N', 'G', 'O'];
         
-        // Add column headers
-        for (let i = 0; i < 5; i++) {
-            const header = document.createElement('div');
-            header.className = 'board-cell center-cell';
-            header.textContent = letters[i];
-            boardElement.appendChild(header);
-        }
-        
-        // Add numbers
         for (let row = 0; row < 5; row++) {
             for (let col = 0; col < 5; col++) {
-                // Center cell is free
                 if (row === 2 && col === 2) {
                     const centerCell = document.createElement('div');
                     centerCell.className = 'board-cell center-cell';
                     centerCell.textContent = '★';
-                    centerCell.onclick = () => this.claimWin();
+                    centerCell.dataset.free = 'true';
+                    centerCell.onclick = () => {
+                        if (this.gameState.status === 'playing' && this.checkWinCondition()) {
+                            this.claimWin();
+                        }
+                    };
                     boardElement.appendChild(centerCell);
                     continue;
                 }
                 
-                const number = boardData[col]?.[row];
-                if (number !== undefined) {
+                const number = boardData?.[row]?.[col];
+                if (number) {
                     const cell = document.createElement('div');
                     cell.className = 'board-cell';
                     cell.textContent = number;
@@ -593,7 +1014,6 @@ class BingoGameClient {
     generate90BallBoard(boardData) {
         const boardElement = document.getElementById('gameBoard');
         
-        // 90-ball uses 9 columns, 3 rows
         for (let row = 0; row < 3; row++) {
             for (let col = 0; col < 9; col++) {
                 const number = boardData[row]?.[col];
@@ -622,7 +1042,6 @@ class BingoGameClient {
     generate30BallBoard(boardData) {
         const boardElement = document.getElementById('gameBoard');
         
-        // 30-ball uses 3x3 grid
         for (let i = 0; i < 9; i++) {
             const number = boardData[i];
             const cell = document.createElement('div');
@@ -639,176 +1058,82 @@ class BingoGameClient {
         }
     }
     
-    toggleMark(number, cell) {
-        if (this.markedNumbers.has(number)) {
-            this.markedNumbers.delete(number);
-            cell.classList.remove('marked');
-        } else {
-            this.markedNumbers.add(number);
-            cell.classList.add('marked');
-        }
+    generateCoverallBoard(boardData) {
+        const boardElement = document.getElementById('gameBoard');
         
-        this.updateBoardStats();
-        this.checkWinCondition();
+        for (let i = 0; i < 45; i++) {
+            const number = boardData[i];
+            const cell = document.createElement('div');
+            cell.className = 'board-cell';
+            cell.textContent = number;
+            cell.dataset.number = number;
+            
+            if (this.markedNumbers.has(number)) {
+                cell.classList.add('marked');
+            }
+            
+            cell.onclick = () => this.toggleMark(number, cell);
+            boardElement.appendChild(cell);
+        }
     }
     
-    markNumberOnBoard(number) {
-        const cells = document.querySelectorAll(`[data-number="${number}"]`);
-        cells.forEach(cell => {
-            if (!cell.classList.contains('marked')) {
-                cell.classList.add('marked');
-                this.markedNumbers.add(number);
-            }
-        });
+    toggleMark(number, cell) {
+        if (this.gameState?.status !== 'playing') return;
+        
+        if (cell.classList.contains('marked')) {
+            cell.classList.remove('marked');
+            this.markedNumbers.delete(number);
+        } else {
+            cell.classList.add('marked');
+            this.markedNumbers.add(number);
+            this.playSound('mark');
+        }
         
         this.updateBoardStats();
         this.checkWinCondition();
     }
     
     updateBoardStats() {
-        const totalCells = document.querySelectorAll('.board-cell:not(.blank-cell)').length;
+        const cells = document.querySelectorAll('.board-cell:not(.blank-cell)');
+        const totalCells = cells.length;
         const markedCount = this.markedNumbers.size;
+        const remainingCount = totalCells - markedCount;
+        const percentage = totalCells > 0 ? Math.round((markedCount / totalCells) * 100) : 0;
         
         document.getElementById('markedCount').textContent = markedCount;
-        document.getElementById('remainingCount').textContent = totalCells - markedCount;
+        document.getElementById('remainingCount').textContent = remainingCount;
+        document.getElementById('percentage').textContent = `${percentage}%`;
     }
     
-    checkWinCondition() {
-        if (!this.playerBoard || !this.gameState) return false;
+    updateGameStats() {
+        if (!this.gameState) return;
         
-        const pattern = this.gameState.winPattern;
-        const isWin = this.checkPatternWin(pattern);
+        document.getElementById('gamePlayerCount').textContent = this.gameState.players.length;
         
-        // Update claim win button
-        document.getElementById('claimWinBtn').disabled = !isWin;
-        
-        return isWin;
-    }
-    
-    checkPatternWin(pattern) {
-        // Simplified win checking
-        // In a real implementation, this would check specific patterns
-        const totalCells = document.querySelectorAll('.board-cell:not(.blank-cell)').length;
-        const markedCount = this.markedNumbers.size;
-        
-        switch(pattern) {
-            case 'full-house':
-                return markedCount >= totalCells * 0.8; // 80% marked for demo
-            case 'one-line':
-                // Check rows
-                return this.checkLineWin();
-            case 'x-pattern':
-                return this.checkXPattern();
-            default:
-                return markedCount >= totalCells * 0.7;
-        }
-    }
-    
-    checkLineWin() {
-        // Check for a completed row
-        const board = document.getElementById('gameBoard');
-        const rows = this.gameState.gameType === '75ball' ? 5 : 
-                    this.gameState.gameType === '90ball' ? 3 : 3;
-        const cols = this.gameState.gameType === '75ball' ? 5 : 
-                    this.gameState.gameType === '90ball' ? 9 : 3;
-        
-        for (let row = 0; row < rows; row++) {
-            let complete = true;
-            for (let col = 0; col < cols; col++) {
-                const cell = board.children[row * cols + col];
-                if (cell && !cell.classList.contains('marked') && !cell.classList.contains('blank-cell')) {
-                    complete = false;
-                    break;
-                }
-            }
-            if (complete) return true;
-        }
-        return false;
-    }
-    
-    checkXPattern() {
-        // Check for X pattern (diagonals)
-        const board = document.getElementById('gameBoard');
-        const size = this.gameState.gameType === '75ball' ? 5 : 3;
-        
-        let diag1 = true;
-        let diag2 = true;
-        
-        for (let i = 0; i < size; i++) {
-            const cell1 = board.children[i * size + i];
-            const cell2 = board.children[i * size + (size - 1 - i)];
-            
-            if (cell1 && !cell1.classList.contains('marked') && !cell1.classList.contains('blank-cell')) {
-                diag1 = false;
-            }
-            if (cell2 && !cell2.classList.contains('marked') && !cell2.classList.contains('blank-cell')) {
-                diag2 = false;
-            }
+        if (this.gameStartTime) {
+            const elapsed = Math.floor((new Date() - this.gameStartTime) / 1000);
+            const minutes = Math.floor(elapsed / 60);
+            const seconds = elapsed % 60;
+            document.getElementById('gameStartTime').textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
         }
         
-        return diag1 || diag2;
-    }
-    
-    detectWinPattern() {
-        if (this.checkLineWin()) return 'one-line';
-        if (this.checkXPattern()) return 'x-pattern';
-        
-        const totalCells = document.querySelectorAll('.board-cell:not(.blank-cell)').length;
-        if (this.markedNumbers.size >= totalCells) return 'full-house';
-        
-        return 'custom';
-    }
-    
-    getWinPatternName(pattern) {
-        const patterns = {
-            'full-house': 'ሙሉ ቤት',
-            'one-line': 'አንድ ረድፍ',
-            'two-lines': 'ሁለት ረድፍ',
-            'x-pattern': 'X ንድፍ',
-            'four-corners': 'አራት ማእዘኖች',
-            'diagonal': 'ዲያግናል',
-            'pattern': 'ተጠቀም ንድፍ'
-        };
-        
-        return patterns[pattern] || pattern;
-    }
-    
-    updateCalledNumbersDisplay() {
-        const container = document.getElementById('calledNumbers');
-        container.innerHTML = '';
-        
-        if (!this.gameState?.calledNumbers) return;
-        
-        this.gameState.calledNumbers.slice(-10).forEach(number => {
-            const element = document.createElement('div');
-            element.className = 'called-number';
-            element.textContent = number;
-            container.appendChild(element);
-        });
-    }
-    
-    addCalledNumber(number) {
-        const container = document.getElementById('calledNumbers');
-        const element = document.createElement('div');
-        element.className = 'called-number';
-        element.textContent = number;
-        container.appendChild(element);
-        
-        // Keep only last 10 numbers
-        const numbers = container.children;
-        if (numbers.length > 10) {
-            container.removeChild(numbers[0]);
+        if (this.gameState.winners) {
+            document.getElementById('winnersCount').textContent = this.gameState.winners.length;
         }
     }
     
     updateRoomsList(rooms) {
         const container = document.getElementById('roomList');
-        container.innerHTML = '';
+        const countElement = document.getElementById('activeRoomsCount');
         
         if (!rooms || rooms.length === 0) {
-            container.innerHTML = '<p style="text-align: center; color: rgba(255,255,255,0.5);">ምንም ንቁ ክፍሎች የሉም</p>';
+            container.innerHTML = '<div class="loading-rooms">No active rooms</div>';
+            countElement.textContent = '0';
             return;
         }
+        
+        countElement.textContent = rooms.length.toString();
+        container.innerHTML = '';
         
         rooms.forEach(room => {
             const element = document.createElement('div');
@@ -820,28 +1145,26 @@ class BingoGameClient {
             
             element.innerHTML = `
                 <div class="room-item-header">
-                    <div class="room-name">${room.gameType} - ${room.hostName}</div>
+                    <div class="room-name">${this.getGameTypeName(room.gameType)} - ${room.hostName}</div>
                     <div class="room-players">${room.playerCount}/10</div>
                 </div>
                 <div class="room-info">
-                    ኮድ: ${room.code}<br>
-                    ሁኔታ: ${room.status === 'waiting' ? 'በመጠበቅ ላይ' : 'በመጫወት ላይ'}
+                    Code: ${room.code}<br>
+                    Status: ${room.status === 'waiting' ? 'Waiting' : 'Playing'}
                 </div>
             `;
-            
             container.appendChild(element);
         });
     }
     
     updateWinnersList() {
         const container = document.getElementById('winnersList');
-        container.innerHTML = '';
-        
         if (!this.gameState?.winners || this.gameState.winners.length === 0) {
-            container.innerHTML = '<p style="text-align: center; color: rgba(255,255,255,0.5);">እስካሁን ምንም አሸናፊ የለም</p>';
+            container.innerHTML = '<div class="no-winners">No winners yet</div>';
             return;
         }
         
+        container.innerHTML = '';
         this.gameState.winners.forEach(winner => {
             const element = document.createElement('div');
             element.className = 'winner-item';
@@ -855,7 +1178,19 @@ class BingoGameClient {
                     <div class="winner-pattern">${this.getWinPatternName(winner.pattern)}</div>
                 </div>
             `;
-            
+            container.appendChild(element);
+        });
+    }
+    
+    updateCalledNumbersDisplay() {
+        const container = document.getElementById('calledNumbers');
+        if (!this.gameState?.calledNumbers) return;
+        
+        container.innerHTML = '';
+        this.gameState.calledNumbers.slice(-10).forEach(number => {
+            const element = document.createElement('div');
+            element.className = 'called-number';
+            element.textContent = number;
             container.appendChild(element);
         });
     }
@@ -877,52 +1212,97 @@ class BingoGameClient {
         
         container.insertBefore(element, container.firstChild);
         
-        // Keep only last 5 winners
         const winners = container.children;
         if (winners.length > 5) {
             container.removeChild(winners[5]);
         }
     }
     
-    addChatMessage(sender, message, isSystem = false) {
-        const container = document.getElementById('chatMessages');
-        const element = document.createElement('div');
-        element.className = `chat-message ${isSystem ? 'system' : ''}`;
+    showWinnerModal(winnerInfo) {
+        const modal = document.getElementById('winnerModal');
+        const winnerInfoElement = document.getElementById('winnerInfo');
+        const patternElement = document.getElementById('modalWinPattern');
+        const amountElement = document.getElementById('modalWinAmount');
         
-        if (isSystem) {
-            element.textContent = message;
+        const isCurrentPlayer = winnerInfo.playerId === this.playerId;
+        const winnerText = isCurrentPlayer 
+            ? `🎉 YOU WON! 🎉`
+            : `🏆 ${winnerInfo.playerName} WON! 🏆`;
+        
+        winnerInfoElement.innerHTML = `<h3>${winnerText}</h3>`;
+        patternElement.textContent = `Pattern: ${this.getWinPatternName(winnerInfo.pattern)}`;
+        
+        if (winnerInfo.prize) {
+            amountElement.textContent = `Prize: ${winnerInfo.prize.toLocaleString()} Birr`;
         } else {
-            element.innerHTML = `<span class="sender">${sender}:</span> ${message}`;
+            amountElement.textContent = 'Congratulations!';
         }
         
-        container.appendChild(element);
-        container.scrollTop = container.scrollHeight;
+        modal.classList.add('active');
+        this.playSound('win');
+        this.lastWinner = winnerInfo;
     }
     
-    // Utility Functions
-    getColorFromName(name) {
-        const colors = [
-            '#0d47a1', '#1a237e', '#311b92', '#4a148c',
-            '#880e4f', '#b71c1c', '#d84315', '#f57c00',
-            '#ff8f00', '#f9a825', '#afb42b', '#689f38',
-            '#388e3c', '#00796b', '#00838f', '#0277bd'
-        ];
-        
-        let hash = 0;
-        for (let i = 0; i < name.length; i++) {
-            hash = name.charCodeAt(i) + ((hash << 5) - hash);
-        }
-        
-        return colors[Math.abs(hash) % colors.length];
+    closeWinnerModal() {
+        document.getElementById('winnerModal').classList.remove('active');
     }
     
-    loadPlayerData() {
-        // Load saved player data
-        const savedName = localStorage.getItem('bingo_player_name');
-        if (savedName) {
-            document.getElementById('playerName').value = savedName;
-            document.getElementById('newPlayerName').value = savedName;
+    shareWin() {
+        if (!this.lastWinner || !navigator.share) return;
+        
+        const isCurrentPlayer = this.lastWinner.playerId === this.playerId;
+        const shareText = isCurrentPlayer
+            ? `🎉 I won at Assefa Digital Bingo! Pattern: ${this.getWinPatternName(this.lastWinner.pattern)} 🎉`
+            : `🏆 ${this.lastWinner.playerName} won at Assefa Digital Bingo! 🏆`;
+        
+        navigator.share({
+            title: 'Assefa Digital Bingo',
+            text: shareText,
+            url: window.location.href
+        }).catch(err => console.log('Share failed:', err));
+    }
+    
+    markAllCalled() {
+        if (!this.gameState?.calledNumbers || !this.playerBoard) return;
+        
+        let markedCount = 0;
+        this.gameState.calledNumbers.forEach(number => {
+            if (!this.markedNumbers.has(number)) {
+                this.markNumberOnBoard(number);
+                markedCount++;
+            }
+        });
+        
+        if (markedCount > 0) {
+            this.showNotification(`Marked ${markedCount} numbers`, 'success');
+            this.playSound('mark');
         }
+    }
+    
+    clearAllMarks() {
+        if (this.markedNumbers.size === 0) return;
+        
+        if (confirm('Clear all marks?')) {
+            this.markedNumbers.clear();
+            this.updateBoardUI();
+            this.updateBoardStats();
+            this.showNotification('All marks cleared', 'info');
+        }
+    }
+    
+    refreshRooms() {
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.sendMessage({ type: 'get_rooms' });
+            this.showNotification('Refreshing rooms...', 'info');
+        }
+    }
+    
+    setupAutoRefresh() {
+        setInterval(() => {
+            if (this.socket && this.socket.readyState === WebSocket.OPEN && !this.currentRoom) {
+                this.sendMessage({ type: 'get_rooms' });
+            }
+        }, 30000);
     }
     
     returnToLobby() {
@@ -937,7 +1317,7 @@ let gameClient;
 document.addEventListener('DOMContentLoaded', () => {
     gameClient = new BingoGameClient();
     
-    // Expose functions to global scope for onclick handlers
+    // Expose functions to global scope
     window.joinRoom = () => gameClient.joinRoom();
     window.createRoom = () => gameClient.createRoom();
     window.leaveRoom = () => gameClient.leaveRoom();
@@ -948,6 +1328,14 @@ document.addEventListener('DOMContentLoaded', () => {
     window.closeWinnerModal = () => gameClient.closeWinnerModal();
     window.closeNotification = () => gameClient.closeNotification();
     window.returnToLobby = () => gameClient.returnToLobby();
+    window.toggleAutoCall = () => gameClient.toggleAutoCall();
+    window.copyRoomCode = () => gameClient.copyRoomCode();
+    window.toggleSound = () => gameClient.toggleSound();
+    window.refreshRooms = () => gameClient.refreshRooms();
+    window.sendQuickChat = (message) => gameClient.sendQuickChat(message);
+    window.markAllCalled = () => gameClient.markAllCalled();
+    window.clearAllMarks = () => gameClient.clearAllMarks();
+    window.shareWin = () => gameClient.shareWin();
     
     // Handle chat input enter key
     document.getElementById('chatInput')?.addEventListener('keypress', (e) => {
