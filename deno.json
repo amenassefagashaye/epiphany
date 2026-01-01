@@ -1,13 +1,53 @@
 {
   "tasks": {
-    "start": "deno run --allow-net --allow-read --allow-env server.ts",
-    "dev": "deno run --watch --allow-net --allow-read --allow-env server.ts"
+    "start": "deno run --allow-net --allow-read --allow-env --allow-write server.ts",
+    "dev": "deno run --watch --allow-net --allow-read --allow-env server.ts",
+    "test": "deno test --allow-net --allow-read --allow-env",
+    "deploy": "deno run --allow-net --allow-read --allow-env --allow-write --no-check server.ts"
   },
   "imports": {
     "oak": "https://deno.land/x/oak@v12.6.1/mod.ts",
-    "websocket": "https://deno.land/x/websocket@v0.1.4/mod.ts"
+    "@oak/commons": "https://deno.land/x/oak@v12.6.1/commons.ts",
+    "ws": "https://deno.land/x/websocket@v0.1.4/mod.ts",
+    "uuid": "https://deno.land/std@0.208.0/uuid/mod.ts",
+    "dotenv": "https://deno.land/x/dotenv@v3.2.2/mod.ts"
   },
   "compilerOptions": {
-    "lib": ["deno.window"]
+    "lib": ["deno.window", "dom", "dom.iterable", "esnext"],
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "fmt": {
+    "files": {
+      "include": ["*.ts", "*.js", "*.json"],
+      "exclude": ["*.min.js", "vendor"]
+    },
+    "options": {
+      "useTabs": false,
+      "lineWidth": 80,
+      "indentWidth": 2,
+      "singleQuote": true,
+      "proseWrap": "preserve"
+    }
+  },
+  "lint": {
+    "files": {
+      "include": ["*.ts"],
+      "exclude": ["*.min.js", "vendor"]
+    },
+    "rules": {
+      "tags": ["recommended"],
+      "include": ["ban-untagged-todo"],
+      "exclude": ["no-unused-vars"]
+    }
+  },
+  "deploy": {
+    "project": "assefa-bingo",
+    "exclude": ["**/node_modules", "**/.git", "**/test", "**/*.test.ts"],
+    "include": ["server.ts", "routes/", "models/", "middleware/", "utils/", "*.json"]
   }
 }
